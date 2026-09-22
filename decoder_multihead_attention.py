@@ -18213,13 +18213,10 @@ A vigil or dreamt rather more than slept.
 
 
 
-  import torch
+import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-
-
-# ---------------- hyperparameters (settings YOU choose; the model doesn't learn these) ----------------
 
 batch_size = 16
 
@@ -18480,22 +18477,6 @@ class LanguageModel_mvp(nn.Module):
 
 
 
-    # def generate(self, idx, max_new_tokens):
-    #     # idx is (B, T) array of indices in the current context
-    #     for _ in range(max_new_tokens):
-    #         # crop idx to the last block_size tokens
-    #         idx_cond = idx[:, -block_size:]
-    #         # get the predictions
-    #         logits, loss = self(idx_cond)
-    #         # focus only on the last time step
-    #         logits = logits[:, -1, :] # becomes (B, C)
-    #         # apply softmax to get probabilities
-    #         probs = F.softmax(logits, dim=-1) # (B, C)
-    #         # sample from the distribution
-    #         idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-    #         # append sampled index to the running sequence
-    #         idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-    #     return idx
 
 model = LanguageModel_mvp()
 
@@ -18534,7 +18515,7 @@ print("Model saved successfully!")
 def generate_text(prompt, max_new_tokens=300, temperature=0.8, top_k=40):
     model.eval()
 
-    # BPE encode — no char validation needed
+
     encoded = encode(prompt)
     print(f"Prompt tokens: {len(encoded)}")
 
@@ -18556,7 +18537,7 @@ def generate_text(prompt, max_new_tokens=300, temperature=0.8, top_k=40):
 
     model.train()
 
-    # Decode only the generated part (strip prompt)
+ 
     generated_ids  = context[0].tolist()
     generated_only = decode(generated_ids[len(encoded):])
 
@@ -18565,7 +18546,7 @@ def generate_text(prompt, max_new_tokens=300, temperature=0.8, top_k=40):
     return generated_only
 
 
-# ── USAGE ──────────────────────────────────────────────────
+
 generate_text(
     prompt="my beatiful wife you are so ",
     max_new_tokens=300,
