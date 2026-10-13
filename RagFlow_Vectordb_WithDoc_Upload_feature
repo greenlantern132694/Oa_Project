@@ -1,0 +1,225 @@
+# Run with:  streamlit run app.py
+
+# 1. Imports (original)
+from dotenv import load_dotenv
+from langchain_mistralai import ChatMistralAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_unstructured import UnstructuredLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import json
+
+# UI imports
+import os
+import time
+import hashlib
+import tempfile
+import streamlit as st
+
+# 1.1 Initialize the load
+load_dotenv()
+
+st.set_page_config(page_title="PDF RAG Assistant", page_icon="📄")
+st.title("📄 PDF RAG Assistant")
+
+
+# Your original setup (unchanged), wrapped so it loads only ONCE, not on every click
+@st.cache_resource(show_spinner="Loading models (first time only)...")
+def load_components():
+    # 3. Create the chunking
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    # 4. Create the embedding
+    embeddings = HuggingFaceEmbeddings(
+        model = "sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    # 5. Load the DB
+    vectorstore = Chroma(
+        collection_name="pdf_documents",
+        persist_directory="./chroma_db_planning",
+            embedding_function=embeddings)
+
+    # 6. Implement retriever
+    retriever = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k":10,
+                "fetch_k":25,
+                "lambda_mult":0.5
+            }
+        )
+
+    # 7. Create Prompt context template
+    prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """You are a helpful AI assistant.
+
+Use ONLY the provided context to answer the question.
+
+If the answer is not present in the context,
+say: "I could not find the answer in the document."
+"""
+                ),
+                (
+                    "human",
+                    """Context:
+{context}
+
+Question:
+{question}
+"""
+                )
+            ]
+        )
+
+    # 8. LLM
+    model = ChatMistralAI(
+        model="open-mistral-7b",
+        temperature=0.1,
+        max_tokens=400,
+    )
+
+    return text_splitter, vectorstore, retriever, prompt, model
+
+
+# Helper function to sanitize metadata for Chroma DB (original)
+def clean_metadata_for_chroma(documents):
+    for doc in documents:
+        cleaned_metadata = {}
+        for key, value in doc.metadata.items():
+            # If the value is a dictionary or complex list/tuple, convert to string
+            if isinstance(value, (dict, list, tuple)):
+                cleaned_metadata[key] = json.dumps(value)
+            else:
+                cleaned_metadata[key] = value
+        doc.metadata = cleaned_metadata
+    return documents
+
+
+text_splitter, vectorstore, retriever, prompt, model = load_components()
+
+
+# Upload: read -> chunk -> clean -> store in Chroma (only if this PDF is not already stored)
+def ingest_pdf(name, data, file_hash):
+    if vectorstore.get(where={"file_hash": file_hash}, limit=1)["ids"]:
+        return ("info", f"'{name}' is already in the database.")
+
+    # 2. Read the data (file_path is now the uploaded PDF)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(data)
+        file_path = tmp.name
+    try:
+        loader = UnstructuredLoader(file_path=file_path)
+        docs = loader.load()
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+    chunks_cleaned = clean_metadata_for_chroma(text_splitter.split_documents(docs))
+    chunks_cleaned = [c for c in chunks_cleaned if c.page_content.strip()]
+    if not chunks_cleaned:
+        return ("warning", f"'{name}' has no readable text.")
+
+    for c in chunks_cleaned:
+        c.metadata["file_name"] = name
+        c.metadata["file_hash"] = file_hash
+    ids = [f"{file_hash}-{i}" for i in range(len(chunks_cleaned))]
+    vectorstore.add_documents(chunks_cleaned, ids=ids)
+    return ("success", f"'{name}' added ({len(chunks_cleaned)} chunks).")
+
+
+# ---------------- Sidebar: upload + stop ----------------
+with st.sidebar:
+    st.header("Upload PDF")
+    uploaded_files = st.file_uploader("Choose PDF(s)", type=["pdf"], accept_multiple_files=True)
+
+    status = st.session_state.setdefault("status", {})
+    for f in uploaded_files or []:
+        data = f.getvalue()
+        file_hash = hashlib.sha256(data).hexdigest()[:32]
+        if file_hash not in status:  # only process each file once
+            with st.spinner(f"Processing {f.name}..."):
+                status[file_hash] = ingest_pdf(f.name, data, file_hash)
+        kind, msg = status[file_hash]
+        getattr(st, kind)(msg)
+
+    st.divider()
+    if st.button("🛑 Stop Session", type="primary"):
+        st.warning("Session stopped. You can close this tab.")
+        time.sleep(1)
+        os._exit(0)
+
+
+def show_chunks(chunks):
+    """Show the chunks the retriever sent to the LLM, with their source file and page."""
+    if not chunks:
+        return
+    with st.expander(f"📚 Retrieved chunks ({len(chunks)})"):
+        for i, c in enumerate(chunks, 1):
+            page = f", page {c['page']}" if c["page"] else ""
+            st.markdown(f"**Chunk {i}** · {c['source']}{page} · {len(c['text'])} characters")
+            st.text(c["text"])
+            st.divider()
+
+
+# ---------------- Chat ----------------
+history = st.session_state.setdefault("history", [])
+for m in history:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+        show_chunks(m.get("chunks", []))
+
+question = st.chat_input("Ask a question about your documents...")
+
+if question:
+    history.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        chunks = []
+        try:
+            with st.spinner("Thinking..."):
+                # 7-9. original steps
+                retrieved_docs = retriever.invoke(question)
+
+                # keep the retrieved chunks so they can be shown in the UI
+                chunks = [
+                    {
+                        "text": d.page_content,
+                        "source": d.metadata.get("file_name") or d.metadata.get("filename") or d.metadata.get("source", "unknown"),
+                        "page": d.metadata.get("page_number") or d.metadata.get("page"),
+                    }
+                    for d in retrieved_docs
+                ]
+
+                context = "\n\n".join(
+                    doc.page_content for doc in retrieved_docs
+                )
+
+                final_prompt = prompt.invoke({
+                    "context": context,
+                    "question": question
+                })
+
+                response = model.invoke(final_prompt)
+                answer = response.content
+            st.markdown(answer)
+            show_chunks(chunks)
+        except Exception as e:
+            answer = f"Something went wrong: {e}"
+            st.error(answer)
+
+    history.append({"role": "assistant", "content": answer, "chunks": chunks})
